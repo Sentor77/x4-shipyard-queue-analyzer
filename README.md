@@ -24,3 +24,5 @@ Save your game. Then run the script.
 ## Output
 
 Shows missing wares per shipyard, grouped by ship.
+
+<img width="874" height="515" alt="mRxbhHbPy0" src="https://github.com/user-attachments/assets/fa6d5bf3-72a0-465a-bd6d-1a3f56231046" />
