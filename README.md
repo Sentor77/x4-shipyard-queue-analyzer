@@ -1,4 +1,4 @@
-# X4 Shipyard Analyzer
+# X4 Shipyard Queue Analyzer
 
 A lightweight PowerShell script that streams X4 Foundations save files (.xml / .xml.gz) and reports which wares are missing to complete queued NPC ship orders - broken down per shipyard and per ship. No in-game diagnostics needed.
 
@@ -9,7 +9,7 @@ A lightweight PowerShell script that streams X4 Foundations save files (.xml / .
 
 ## Usage
 
-    .\x4-shipyard-analyzer.ps1
+    .\x4-shipyard-queue-analyzer.ps1
 
 Or specify a save path directly:
 
