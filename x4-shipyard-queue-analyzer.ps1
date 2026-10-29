@@ -1,9 +1,10 @@
 <#
 .SYNOPSIS
-    Analysiert X4 Foundations Savegames auf fehlende Werft-Ressourcen pro Spieler-Werft.
+    Analyzes X4 Foundations savegames for missing shipyard resources per player shipyard.
 .DESCRIPTION
-    Liest zeilenweise (Streaming) .xml oder .xml.gz Savegames aus und listet
-    blockierte Bauteile in den Bauschlangen aller eigenen Werften auf.
+    Reads line-by-line (streaming) .xml or .xml.gz savegames with UTF-8 encoding.
+    Extracts missing components in active build queues, ignores deleted tasks,
+    maps them to respective ships (extracted from macro/component), and cross-checks against the station's buy list.
 #>
 
 [CmdletBinding()]
@@ -11,143 +12,161 @@ param (
     [string]$SavePath = ""
 )
 
-# 1. Pfad ermitteln (Default: Standard-Dokumenten-Ordner von Egosoft)
+# Helper function to read attributes reliably (space prefix avoids matching "basename" when searching "name")
+function Get-Attr([string]$Line, [string]$Name) {
+    $key = " $Name=" + [char]34
+    $i = $Line.IndexOf($key)
+    if ($i -lt 0) { return $null }
+    $i += $key.Length
+    $end = $Line.IndexOf([char]34, $i)
+    if ($end -lt $i) { return $null }
+    return $Line.Substring($i, $end - $i)
+}
+
+# 1. Determine Path (Default: Standard Egosoft Documents Path)
 if ([string]::IsNullOrWhiteSpace($SavePath)) {
     $defaultPath = Join-Path -Path ([System.Environment]::GetFolderPath('MyDocuments')) -ChildPath "Egosoft\X4"
-    
-    Write-Host "=== X4 Savegame Analyzer ===" -ForegroundColor Cyan
-    Write-Host "Standardpfad: $defaultPath" -ForegroundColor Gray
-    $userInput = Read-Host "Pfad anpassen (Enter fuer Standardpfad)"
-    
+
+    Write-Host "=== X4 Savegame Shipyard Analyzer ===" -ForegroundColor Cyan
+    Write-Host "Default path: $defaultPath" -ForegroundColor Gray
+    $userInput = Read-Host "Custom path (Press Enter for default)"
+
     if ([string]::IsNullOrWhiteSpace($userInput)) {
         $SavePath = $defaultPath
     } else {
-        $SavePath = $userInput.Trim('"') # Entfernt evtl. Anfuehrungszeichen bei Drag&Drop
+        $SavePath = $userInput.Trim('"') # Remove drag & drop quotes
     }
 }
 
-# 2. Prüfen, ob der Pfad existiert und Savegames enthält
+# 2. Check if path exists and filter for genuine X4 savegame files
 if (-not (Test-Path $SavePath)) {
-    Write-Host "`n[FEHLER] Der angegebene Pfad wurde nicht gefunden:" -ForegroundColor Red
+    Write-Host "`n[ERROR] The specified path was not found:" -ForegroundColor Red
     Write-Host "'$SavePath'" -ForegroundColor Yellow
-    Write-Host "Bitte ueberpruefe den Pfad und starte das Skript erneut." -ForegroundColor Red
+    Write-Host "Please check the path and run the script again." -ForegroundColor Red
     return
 }
 
-# Suche nach .xml und .xml.gz Dateien
-$saveFiles = Get-ChildItem -Path $SavePath -Recurse -Include *.xml, *.xml.gz -ErrorAction SilentlyContinue | 
-             Sort-Object LastWriteTime -Descending
+$resolvedRoot = (Resolve-Path $SavePath).Path.TrimEnd('\', '/')
+$saveFiles = @(Get-ChildItem -Path $SavePath -Recurse -File -Include save_*.xml, save_*.xml.gz, autosave_*.xml, autosave_*.xml.gz, quicksave.xml, quicksave.xml.gz -ErrorAction SilentlyContinue |
+             Where-Object { $_.Directory.Name -ieq 'save' -or $_.DirectoryName.TrimEnd('\', '/') -eq $resolvedRoot } |
+             Sort-Object LastWriteTime -Descending)
 
 if ($saveFiles.Count -eq 0) {
-    Write-Host "`n[HINWEIS] Keine Savegame-Dateien (.xml oder .xml.gz) gefunden in:" -ForegroundColor Red
+    Write-Host "`n[NOTICE] No savegame files (save_*, autosave_*, quicksave .xml/.xml.gz) found in:" -ForegroundColor Red
     Write-Host "'$SavePath'" -ForegroundColor Yellow
-    Write-Host "Stelle sicher, dass im Ordner (oder dessen Unterordnern) Savegames liegen." -ForegroundColor Gray
+    Write-Host "Make sure savegames are located in this directory or subdirectories." -ForegroundColor Gray
     return
 }
 
-# 3. Auswahlliste anzeigen
+# 3. Display selection list
 Write-Host ""
-Write-Host "=== Verfuegbare Savegames ===" -ForegroundColor Cyan
+Write-Host "=== Available Savegames ===" -ForegroundColor Cyan
 for ($i = 0; $i -lt $saveFiles.Count; $i++) {
     $file = $saveFiles[$i]
     $sizeMB = [math]::Round($file.Length / 1MB, 2)
-    Write-Host "[$($i + 1)] $($file.Name) ($sizeMB MB) - Letzte Aenderung: $($file.LastWriteTime)"
+    Write-Host "[$($i + 1)] $($file.Name) ($sizeMB MB) - Last Modified: $($file.LastWriteTime)"
 }
 
-$selection = Read-Host "`nBitte waehle ein Savegame aus (1-$($saveFiles.Count))"
-$selectedIndex = [int]$selection - 1
-
-if ($selectedIndex -lt 0 -or $selectedIndex -ge $saveFiles.Count) {
-    Write-Host "Ungueltige Auswahl!" -ForegroundColor Red
+$selection = Read-Host "`nPlease select a savegame (1-$($saveFiles.Count))"
+$selectedIndex = 0
+if (-not [int]::TryParse($selection, [ref]$selectedIndex) -or $selectedIndex -lt 1 -or $selectedIndex -gt $saveFiles.Count) {
+    Write-Host "Invalid selection!" -ForegroundColor Red
     return
 }
 
-$targetFile = $saveFiles[$selectedIndex]
+$targetFile = $saveFiles[$selectedIndex - 1]
 Write-Host ""
-Write-Host "Analysiere Werft-Bauschlangen in '$($targetFile.Name)'..." -ForegroundColor Green
+Write-Host "Analyzing shipyard build queues in '$($targetFile.Name)'..." -ForegroundColor Green
 
-# 4. Stream-Reader einrichten (unterstuetzt .xml und .xml.gz)
+# 4. Setup Stream-Reader with explicit UTF-8 Encoding
+$gzipStream = $null
 $fileStream = [System.IO.File]::OpenRead($targetFile.FullName)
+$utf8 = [System.Text.Encoding]::UTF8
+
 if ($targetFile.Extension -eq '.gz') {
     $gzipStream = New-Object System.IO.Compression.GZipStream($fileStream, [System.IO.Compression.CompressionMode]::Decompress)
-    $reader = New-Object System.IO.StreamReader($gzipStream)
+    $reader = New-Object System.IO.StreamReader($gzipStream, $utf8)
 } else {
-    $reader = New-Object System.IO.StreamReader($fileStream)
+    $reader = New-Object System.IO.StreamReader($fileStream, $utf8)
 }
 
-# Speicherstruktur: Dictionary mit [StationName] = HashSet[Waren]
-$shipyardResults = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.HashSet[string]]]::new()
+$results = New-Object System.Collections.Generic.List[object]
 
-$inShipyard = $false
+# <build> entries carry no ship macro, only a component ID that points to a ship
+# object elsewhere in the savegame (before OR after the station). So we collect
+# id -> macro for all ships in the same pass and resolve names afterwards.
+$shipMacros = New-Object 'System.Collections.Generic.Dictionary[string,string]'
+
+$station      = $null   # Current player station
+$depth        = 0       # Component nesting depth inside the station
 $inBuildtasks = $false
-$currentStationName = ""
-$currentWares = $null
+$inQueue      = $false  # Only <queue> counts, <removed> (deleted tasks) is ignored
+$inInsuff     = $false
+$order        = $null
 
-# Such-Tags
-$tagStation = "class=" + [char]34 + "station" + [char]34
-$tagPlayer = "owner=" + [char]34 + "player" + [char]34
-$tagShipyard1 = "Shipyard"
-$tagShipyard2 = "shipyard"
-$tagNameKey = "name=" + [char]34
-$tagBuildOpen = [char]60 + "buildtasks" + [char]62
-$tagBuildClose = [char]60 + "/buildtasks" + [char]62
-$tagStationClose = [char]60 + "/component" + [char]62
-$tagWareKey = "ware=" + [char]34
-
-# 5. Datei zeilenweise parsen
+# 5. Parse file line by line
 try {
-    while (($line = $reader.ReadLine()) -ne $null) {
-        # Prüft auf Station + Player-Besitz + Werft-Klasse
-        if ($line.Contains($tagStation) -and $line.Contains($tagPlayer) -and ($line.Contains($tagShipyard1) -or $line.Contains($tagShipyard2))) {
-            $inShipyard = $true
-            
-            # Stationsnamen extrahieren
-            if ($line.Contains($tagNameKey)) {
-                $idxName = $line.IndexOf($tagNameKey)
-                $startName = $idxName + $tagNameKey.Length
-                $endName = $line.IndexOf([char]34, $startName)
-                if ($endName -gt $startName) {
-                    $currentStationName = $line.Substring($startName, $endName - $startName)
-                }
-            } else {
-                $currentStationName = "Unbenannte Spieler-Werft"
-            }
+    while ($null -ne ($line = $reader.ReadLine())) {
+        $t = $line.TrimStart()
 
-            # Eigenes Ware-Set für diese spezifische Werft anlegen
-            if (-not $shipyardResults.ContainsKey($currentStationName)) {
-                $shipyardResults[$currentStationName] = New-Object System.Collections.Generic.HashSet[string]
-            }
-            $currentWares = $shipyardResults[$currentStationName]
+        if ($t.StartsWith('<component class="ship_')) {
+            $sid = Get-Attr $t 'id'
+            $smac = Get-Attr $t 'macro'
+            if ($sid -and $smac) { $shipMacros[$sid] = $smac }
         }
 
-        if ($inShipyard) {
-            if ($line.Contains($tagBuildOpen)) {
-                $inBuildtasks = $true
+        if ($null -eq $station) {
+            if ($t.StartsWith('<component class="station"') -and $t.Contains(' owner="player"')) {
+                $name = Get-Attr $t 'name'
+                $code = Get-Attr $t 'code'
+                if ([string]::IsNullOrEmpty($name)) { $name = "Player Station (Unnamed)" }
+                $station = [pscustomobject]@{ Name = $name; Code = $code; Buy = @(); Orders = (New-Object System.Collections.Generic.List[object]) }
+                $depth = 1
             }
+            continue
+        }
 
-            if ($inBuildtasks) {
-                if ($line.Contains($tagWareKey)) {
-                    $idx = $line.IndexOf($tagWareKey)
-                    if ($idx -ge 0) {
-                        $start = $idx + $tagWareKey.Length
-                        $end = $line.IndexOf([char]34, $start)
-                        if ($end -gt $start) {
-                            $ware = $line.Substring($start, $end - $start)
-                            $null = $currentWares.Add($ware)
-                        }
+        # Track nested components (modules, docked ships)
+        if ($t.StartsWith('<component ')) {
+            if (-not $t.EndsWith('/>')) { $depth++ }
+            continue
+        }
+        if ($t.StartsWith('</component>')) {
+            $depth--
+            if ($depth -eq 0) {
+                if ($station.Orders.Count -gt 0) { $results.Add($station) }
+                $station = $null
+            }
+            continue
+        }
+        if ($depth -ne 1) { continue }   # Only evaluate station-level tags
+
+        if ($t.StartsWith('<setting name="buy"')) {
+            $w = Get-Attr $t 'wares'
+            if ($w) { $station.Buy = $w -split ' ' }
+        }
+        elseif ($t.StartsWith('<buildtasks>'))  { $inBuildtasks = $true }
+        elseif ($t.StartsWith('</buildtasks>')) { $inBuildtasks = $false; $inQueue = $false }
+        elseif ($inBuildtasks) {
+            if     ($t.StartsWith('<queue>'))  { $inQueue = $true }
+            elseif ($t.StartsWith('</queue>')) { $inQueue = $false }
+            elseif ($inQueue) {
+                if ($t.StartsWith('<build ')) {
+                    $order = [pscustomobject]@{
+                        Faction   = Get-Attr $t 'faction'
+                        Type      = Get-Attr $t 'type'
+                        Component = Get-Attr $t 'component'
+                        ShipName  = ""   # resolved after parsing
+                        Missing   = (New-Object System.Collections.Generic.List[string])
                     }
+                    $station.Orders.Add($order)
                 }
-
-                if ($line.Contains($tagBuildClose)) {
-                    $inBuildtasks = $false
+                elseif ($t.StartsWith('</build>'))        { $order = $null; $inInsuff = $false }
+                elseif ($t.StartsWith('<insufficient>'))  { $inInsuff = $true }
+                elseif ($t.StartsWith('</insufficient>')) { $inInsuff = $false }
+                elseif ($inInsuff -and $order -and $t.StartsWith('<ware ')) {
+                    $order.Missing.Add((Get-Attr $t 'ware'))
                 }
-            }
-
-            # Beendet das Auslesen dieser spezifischen Werft, wenn das Tag schließt
-            if ($line.Contains($tagStationClose) -and -not $inBuildtasks) {
-                $inShipyard = $false
-                $currentStationName = ""
-                $currentWares = $null
             }
         }
     }
@@ -158,27 +177,59 @@ finally {
     $fileStream.Close()
 }
 
-# 6. Ergebnis strukturiert nach Werften ausgeben
-Write-Host ""
-Write-Host "=== ANALYSE-ERGEBNIS PRO WERFT ===" -ForegroundColor Cyan
+# Resolve readable ship names, e.g. "ship_arg_s_fighter_01_a_macro" -> "ARG s fighter 01 a"
+foreach ($s in $results) {
+    foreach ($o in $s.Orders) {
+        $macro = $null
+        if ($o.Component) { $null = $shipMacros.TryGetValue($o.Component, [ref]$macro) }
 
-if ($shipyardResults.Count -eq 0) {
-    Write-Host "Keine Spieler-Werften im Savegame gefunden!" -ForegroundColor Yellow
-} else {
-    foreach ($station in $shipyardResults.Keys) {
-        Write-Host ""
-        Write-Host "------------------------------------------" -ForegroundColor DarkGray
-        Write-Host " WERFT: $station" -ForegroundColor Yellow
-        Write-Host "------------------------------------------" -ForegroundColor DarkGray
-        
-        $wares = $shipyardResults[$station]
-        if ($wares.Count -gt 0) {
-            Write-Host " Fehlende Waren in der Bauschlange:" -ForegroundColor Red
-            foreach ($ware in $wares) {
-                Write-Host "  - $ware" -ForegroundColor Red
-            }
+        if ($macro -and $macro -match '^ship_([a-z]+)_(.+)_macro$') {
+            $name = "$($Matches[1].ToUpper()) $($Matches[2] -replace '_', ' ')"
         } else {
-            Write-Host " Keine blockierten Bauauftraege." -ForegroundColor Green
+            $name = "Unknown ship ($($o.Component))"
         }
+        if ($o.Faction) { $name += " for $($o.Faction)" }
+        if ($o.Type -and $o.Type -ne 'buildship') { $name += " [$($o.Type)]" }
+        $o.ShipName = $name
+    }
+}
+
+# 6. Format and display results per shipyard and missing ware
+Write-Host ""
+Write-Host "=== ANALYSIS RESULTS PER SHIPYARD ===" -ForegroundColor Cyan
+
+if ($results.Count -eq 0) {
+    Write-Host "No player shipyards with active build orders found." -ForegroundColor Yellow
+    return
+}
+
+foreach ($s in $results) {
+    $label = $s.Name
+    if ($s.Code) { $label += " ($($s.Code))" }
+
+    Write-Host ""
+    Write-Host "--------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host " SHIPYARD: $label" -ForegroundColor Yellow
+    Write-Host "--------------------------------------------------" -ForegroundColor DarkGray
+
+    $blocked = @($s.Orders | Where-Object { $_.Missing.Count -gt 0 })
+    Write-Host " Total orders in queue: $($s.Orders.Count) | Blocked: $($blocked.Count)"
+
+    if ($blocked.Count -eq 0) {
+        Write-Host " No blocked build tasks." -ForegroundColor Green
+        continue
+    }
+
+    $byWare = $blocked | ForEach-Object { $o = $_; $o.Missing | ForEach-Object { [pscustomobject]@{ Ware = $_; ShipName = $o.ShipName } } } |
+              Group-Object Ware | Sort-Object Count -Descending
+
+    Write-Host " Missing Wares:" -ForegroundColor Red
+    foreach ($g in $byWare) {
+        $ships = ($g.Group | Group-Object ShipName | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', '
+        $hint = ""
+        if ($s.Buy.Count -gt 0 -and $s.Buy -notcontains $g.Name) {
+            $hint = "  <-- NOT on station buy list (Missing Blueprint?)"
+        }
+        Write-Host ("  - {0}: blocks {1} order(s) ({2}){3}" -f $g.Name, $g.Count, $ships, $hint) -ForegroundColor Red
     }
 }
